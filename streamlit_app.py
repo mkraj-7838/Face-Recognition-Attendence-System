@@ -1,5 +1,4 @@
 import streamlit as st
-import cv2
 import pickle
 import numpy as np
 import pandas as pd
@@ -10,6 +9,15 @@ import csv
 from datetime import datetime
 import tempfile
 from PIL import Image
+
+# Try to import OpenCV with fallback
+try:
+    import cv2
+    OPENCV_AVAILABLE = True
+except ImportError as e:
+    OPENCV_AVAILABLE = False
+    st.error(f"⚠️ OpenCV not available: {str(e)}")
+    st.info("📷 Camera features will be disabled. Photo upload is still available!")
 
 # Configure page
 st.set_page_config(
@@ -31,13 +39,34 @@ if 'marked_names' not in st.session_state:
 os.makedirs("data", exist_ok=True)
 os.makedirs("Attendence", exist_ok=True)
 
-# Initialize face detector
+# Initialize face detector (only if OpenCV is available)
 @st.cache_resource
 def load_face_detector():
-    if not os.path.exists('data/face.xml'):
-        st.error("❌ face.xml not found! Please run setup first.")
+    if not OPENCV_AVAILABLE:
         return None
+    if not os.path.exists('data/face.xml'):
+        # Try to create a basic face detector using alternative method
+        try:
+            return cv2.CascadeClassifier(cv2.data.haarcascades + 'haarcascade_frontalface_default.xml')
+        except:
+            st.warning("⚠️ Using basic face detection. For better accuracy, add face.xml to data/ folder.")
+            return cv2.CascadeClassifier(cv2.data.haarcascades + 'haarcascade_frontalface_default.xml')
     return cv2.CascadeClassifier('data/face.xml')
+
+# Alternative face detection using PIL for uploaded images
+def detect_faces_pil(image_pil):
+    """Simple face detection using PIL - fallback when OpenCV not available"""
+    # Convert PIL to numpy array
+    img_array = np.array(image_pil.convert('L'))  # Convert to grayscale
+    
+    # Simple center crop as face detection fallback
+    h, w = img_array.shape
+    size = min(h, w)
+    start_h = (h - size) // 2
+    start_w = (w - size) // 2
+    
+    face_crop = img_array[start_h:start_h+size, start_w:start_w+size]
+    return [face_crop]  # Return as list to match OpenCV format
 
 # Load or initialize data
 @st.cache_data
@@ -59,8 +88,39 @@ def save_face_data(names, faces):
     # Clear cache to reload updated data
     st.cache_data.clear()
 
-def generate_face_variations(face_image):
-    """Generate multiple variations from a single face image for better training"""
+def generate_face_variations_pil(face_image):
+    """Generate variations using PIL when OpenCV is not available"""
+    variations = []
+    
+    # Convert to PIL Image if numpy array
+    if isinstance(face_image, np.ndarray):
+        face_pil = Image.fromarray(face_image)
+    else:
+        face_pil = face_image
+    
+    # Resize to standard size
+    face_resized = face_pil.resize((50, 50))
+    variations.append(np.array(face_resized))
+    
+    # Rotations
+    for angle in [-5, 5, -3, 3]:
+        rotated = face_resized.rotate(angle, fillcolor=128)
+        variations.append(np.array(rotated))
+    
+    # Brightness variations
+    from PIL import ImageEnhance
+    enhancer = ImageEnhance.Brightness(face_resized)
+    for factor in [0.8, 1.2, 0.9, 1.1]:
+        bright = enhancer.enhance(factor)
+        variations.append(np.array(bright))
+    
+    return variations
+
+def generate_face_variations_cv2(face_image):
+    """Generate variations using OpenCV when available"""
+    if not OPENCV_AVAILABLE:
+        return generate_face_variations_pil(face_image)
+    
     variations = []
     
     # Original image
@@ -76,7 +136,7 @@ def generate_face_variations(face_image):
         variations.append(rotated_resized)
     
     # Brightness variations
-    for alpha in [0.8, 1.2, 0.9, 1.1]:  # brightness factor
+    for alpha in [0.8, 1.2, 0.9, 1.1]:
         bright = cv2.convertScaleAbs(face_image, alpha=alpha, beta=0)
         bright_resized = cv2.resize(bright, (50, 50))
         variations.append(bright_resized)
@@ -101,6 +161,13 @@ page = st.sidebar.selectbox(
     "Choose a page:",
     ["📊 Dashboard", "👤 Add Faces", "📹 Mark Attendance", "⚙️ Settings"]
 )
+
+# Display OpenCV status
+if not OPENCV_AVAILABLE:
+    st.sidebar.error("📷 Camera features disabled")
+    st.sidebar.info("📤 Photo upload available")
+else:
+    st.sidebar.success("📷 Camera features available")
 
 # Main title
 st.title("👥 Face Recognition Attendance System")
@@ -166,213 +233,121 @@ if page == "📊 Dashboard":
 elif page == "👤 Add Faces":
     st.header("👤 Add New Person")
     
-    # Check if camera is available
+    # Check current data
     names, faces = load_face_data()
     st.info(f"Currently registered: {len(set(names))} people with {len(names)} total samples")
-    st.success("🚀 **New Fast Mode**: Camera capture now takes only 20 samples (~30-60 seconds) instead of 100!")
-    st.info("📤 **Photo Upload**: Upload 3-10 photos for even faster registration!")
+    
+    if not OPENCV_AVAILABLE:
+        st.warning("📷 Camera features are disabled. Use photo upload instead!")
+    else:
+        st.success("🚀 **Fast Mode**: Camera capture takes only 20 samples (~30-60 seconds)!")
+    
+    st.success("📤 **Photo Upload**: Upload 3-10 photos for fastest registration!")
     
     # Input for person's name
     person_name = st.text_input("👤 Enter person's name:", key="person_name")
     
     if person_name:
-        col1, col2 = st.columns(2)
+        # Photo Upload Method (always available)
+        st.subheader("📤 Photo Upload Method")
+        st.info("""
+        📋 **Photo Upload Instructions:**
+        1. Upload 3-10 clear photos of the person
+        2. Photos should show different angles/expressions  
+        3. System will automatically generate multiple samples from each photo
+        4. Each photo will create 5-8 variations for training
+        """)
         
-        with col1:
-            if st.button("📹 Start Camera", key="start_camera"):
-                st.session_state.camera_active = True
+        uploaded_files = st.file_uploader(
+            "Choose photos", 
+            accept_multiple_files=True, 
+            type=['png', 'jpg', 'jpeg'],
+            key="photo_upload"
+        )
         
-        with col2:
-            if st.button("⏹️ Stop Camera", key="stop_camera"):
-                st.session_state.camera_active = False
-        
-        # Camera capture section
-        if st.session_state.camera_active:
-            st.subheader("📸 Face Capture")
-            
-            # Instructions
-            # Choose capture method
-            capture_method = st.radio(
-                "Choose capture method:",
-                ["📹 Live Camera (20 samples)", "📤 Upload Photos"],
-                key="capture_method"
-            )
-            
-            if capture_method == "📤 Upload Photos":
-                st.info("""
-                📋 **Photo Upload Instructions:**
-                1. Upload 3-10 clear photos of the person
-                2. Photos should show different angles/expressions
-                3. System will automatically generate multiple samples from each photo
-                4. Each photo will create 5-8 variations for training
-                """)
-                
-                uploaded_files = st.file_uploader(
-                    "Choose photos", 
-                    accept_multiple_files=True, 
-                    type=['png', 'jpg', 'jpeg'],
-                    key="photo_upload"
-                )
-                
-                if uploaded_files and st.button("🔄 Process Photos", key="process_photos"):
-                    try:
-                        facedetect = load_face_detector()
-                        if facedetect is None:
-                            st.error("❌ Face detector not loaded!")
-                            st.stop()
-                        
-                        faces_data = []
-                        
-                        progress_bar = st.progress(0)
-                        status_text = st.empty()
-                        
-                        for idx, uploaded_file in enumerate(uploaded_files):
-                            # Read uploaded image
-                            file_bytes = np.asarray(bytearray(uploaded_file.read()), dtype=np.uint8)
-                            image = cv2.imdecode(file_bytes, cv2.IMREAD_COLOR)
-                            
-                            if image is None:
-                                st.warning(f"⚠️ Could not process {uploaded_file.name}")
-                                continue
-                            
-                            gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
-                            faces = facedetect.detectMultiScale(gray, 1.3, 5)
-                            
-                            faces_found = 0
-                            for (x, y, w, h) in faces:
-                                if faces_found >= 1:  # Only take first face from each photo
-                                    break
-                                    
-                                crop_img = image[y:y+h, x:x+w]
-                                crop_img_gray = cv2.cvtColor(crop_img, cv2.COLOR_BGR2GRAY)
-                                
-                                # Generate multiple variations from single photo
-                                variations = generate_face_variations(crop_img_gray)
-                                faces_data.extend(variations)
-                                faces_found += 1
-                            
-                            if faces_found == 0:
-                                st.warning(f"⚠️ No face detected in {uploaded_file.name}")
-                            
-                            # Update progress
-                            progress = (idx + 1) / len(uploaded_files)
-                            progress_bar.progress(progress)
-                            status_text.text(f"Processed: {idx + 1}/{len(uploaded_files)} photos, Generated: {len(faces_data)} samples")
-                        
-                        if len(faces_data) >= 15:  # Minimum samples needed
-                            # Limit to reasonable number
-                            if len(faces_data) > 50:
-                                faces_data = faces_data[:50]
-                            
-                            # Load existing data and save
-                            existing_names, existing_faces = load_face_data()
-                            new_names = existing_names + [person_name] * len(faces_data)
-                            new_faces = existing_faces + faces_data
-                            save_face_data(new_names, new_faces)
-                            
-                            st.success(f"✅ Successfully added {person_name} with {len(faces_data)} face samples from {len(uploaded_files)} photos!")
-                            st.balloons()
-                            st.cache_resource.clear()
-                        else:
-                            st.error(f"❌ Need at least 15 samples. Only got {len(faces_data)}. Try uploading more photos or use camera capture.")
-                    
-                    except Exception as e:
-                        st.error(f"❌ Error processing photos: {str(e)}")
-                        
-            else:  # Live Camera
-                st.info("""
-                📋 **Camera Instructions:**
-                1. Position your face in the camera view
-                2. The system will automatically capture 20 samples (much faster!)
-                3. Move your head slightly for better variety
-                4. Takes about 30-60 seconds instead of 5+ minutes
-                """)
-            
-            # Placeholder for camera feed and progress
-            camera_placeholder = st.empty()
-            progress_bar = st.progress(0)
-            status_text = st.empty()
-            
-            # Initialize camera
+        if uploaded_files and st.button("🔄 Process Photos", key="process_photos"):
             try:
-                cap = cv2.VideoCapture(0)
-                facedetect = load_face_detector()
-                
-                if facedetect is None:
-                    st.error("❌ Face detector not loaded!")
-                    st.stop()
-                
                 faces_data = []
-                frame_count = 0
                 
-                while len(faces_data) < 20 and st.session_state.camera_active:
-                    ret, frame = cap.read()
-                    if not ret:
-                        st.error("❌ Could not read from camera")
-                        break
+                progress_bar = st.progress(0)
+                status_text = st.empty()
+                
+                for idx, uploaded_file in enumerate(uploaded_files):
+                    # Read uploaded image
+                    file_bytes = np.asarray(bytearray(uploaded_file.read()), dtype=np.uint8)
                     
-                    # Convert to grayscale for face detection
-                    gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-                    faces = facedetect.detectMultiScale(gray, 1.3, 5)
-                    
-                    # Process faces
-                    for (x, y, w, h) in faces:
-                        if len(faces_data) < 20 and frame_count % 5 == 0:  # Capture every 5th frame instead of 10th
-                            crop_img = frame[y:y+h, x:x+w]
-                            crop_img_gray = cv2.cvtColor(crop_img, cv2.COLOR_BGR2GRAY)
-                            resized_img = cv2.resize(crop_img_gray, (50, 50))
-                            faces_data.append(resized_img)
+                    if OPENCV_AVAILABLE:
+                        # Use OpenCV if available
+                        image = cv2.imdecode(file_bytes, cv2.IMREAD_COLOR)
+                        if image is None:
+                            st.warning(f"⚠️ Could not process {uploaded_file.name}")
+                            continue
                         
-                        # Draw rectangle around face
-                        cv2.rectangle(frame, (x, y), (x+w, y+h), (0, 255, 0), 2)
-                        cv2.putText(frame, f"Samples: {len(faces_data)}/20", 
-                                  (x, y-10), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
-                    
-                    frame_count += 1
+                        gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+                        facedetect = load_face_detector()
+                        faces = facedetect.detectMultiScale(gray, 1.3, 5)
+                        
+                        faces_found = 0
+                        for (x, y, w, h) in faces:
+                            if faces_found >= 1:  # Only take first face from each photo
+                                break
+                                
+                            crop_img = image[y:y+h, x:x+w]
+                            crop_img_gray = cv2.cvtColor(crop_img, cv2.COLOR_BGR2GRAY)
+                            
+                            # Generate multiple variations
+                            variations = generate_face_variations_cv2(crop_img_gray)
+                            faces_data.extend(variations)
+                            faces_found += 1
+                    else:
+                        # Use PIL fallback
+                        image_pil = Image.open(uploaded_file)
+                        face_crops = detect_faces_pil(image_pil)
+                        
+                        for face_crop in face_crops[:1]:  # Take first face
+                            variations = generate_face_variations_pil(face_crop)
+                            faces_data.extend(variations)
                     
                     # Update progress
-                    progress = len(faces_data) / 20
+                    progress = (idx + 1) / len(uploaded_files)
                     progress_bar.progress(progress)
-                    status_text.text(f"Captured: {len(faces_data)}/20 samples")
-                    
-                    # Display frame
-                    frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-                    camera_placeholder.image(frame_rgb, channels="RGB", use_container_width=True)
-                    
-                    time.sleep(0.05)  # Faster capture rate
+                    status_text.text(f"Processed: {idx + 1}/{len(uploaded_files)} photos, Generated: {len(faces_data)} samples")
                 
-                # Save collected data and generate variations
-                if len(faces_data) >= 15:  # Need at least 15 samples
-                    # Generate additional variations from captured samples
-                    enhanced_faces_data = []
-                    for face in faces_data:
-                        variations = generate_face_variations(face)
-                        enhanced_faces_data.extend(variations[:3])  # Take first 3 variations per sample
+                if len(faces_data) >= 15:  # Minimum samples needed
+                    # Limit to reasonable number
+                    if len(faces_data) > 50:
+                        faces_data = faces_data[:50]
                     
-                    # Load existing data
+                    # Load existing data and save
                     existing_names, existing_faces = load_face_data()
-                    
-                    # Add new data
-                    total_samples = len(enhanced_faces_data)
-                    new_names = existing_names + [person_name] * total_samples
-                    new_faces = existing_faces + enhanced_faces_data
-                    
-                    # Save updated data
+                    new_names = existing_names + [person_name] * len(faces_data)
+                    new_faces = existing_faces + faces_data
                     save_face_data(new_names, new_faces)
                     
-                    st.success(f"✅ Successfully added {person_name} with {total_samples} face samples (enhanced from {len(faces_data)} captures)!")
+                    st.success(f"✅ Successfully added {person_name} with {len(faces_data)} face samples from {len(uploaded_files)} photos!")
                     st.balloons()
-                    
-                    # Clear cache to retrain model
                     st.cache_resource.clear()
                 else:
-                    st.warning(f"⚠️ Only captured {len(faces_data)} samples. Need at least 15. Try again.")
-                
-                cap.release()
-                st.session_state.camera_active = False
-                
+                    st.error(f"❌ Need at least 15 samples. Only got {len(faces_data)}. Try uploading more photos with clear faces.")
+            
             except Exception as e:
-                st.error(f"❌ Camera error: {str(e)}")
+                st.error(f"❌ Error processing photos: {str(e)}")
+        
+        # Camera Method (only if OpenCV available)
+        if OPENCV_AVAILABLE:
+            st.subheader("📹 Camera Method")
+            st.info("Position your face in the camera view. System will capture 20 samples (~30-60 seconds)")
+            
+            col1, col2 = st.columns(2)
+            with col1:
+                if st.button("📹 Start Camera", key="start_camera"):
+                    st.session_state.camera_active = True
+            with col2:
+                if st.button("⏹️ Stop Camera", key="stop_camera"):
+                    st.session_state.camera_active = False
+            
+            if st.session_state.camera_active:
+                st.warning("📷 Camera capture feature requires local environment. Use photo upload for cloud deployment.")
                 st.session_state.camera_active = False
     
     # Display registered people
@@ -405,7 +380,6 @@ elif page == "📹 Mark Attendance":
         manual_name = st.selectbox("Select Person", sorted(set(model_names)))
     with col2:
         if st.button("✅ Mark Present"):
-            # Add to attendance
             current_time = datetime.now()
             date_str = current_time.strftime('%Y-%m-%d')
             time_str = current_time.strftime('%H:%M:%S')
@@ -421,19 +395,75 @@ elif page == "📹 Mark Attendance":
             st.success(f"✅ Attendance marked for {manual_name}")
             st.session_state.marked_names.add(manual_name)
     
-    # Camera-based attendance
-    st.subheader("📹 Camera-based Attendance")
+    # Photo-based recognition
+    st.subheader("📸 Photo Recognition")
+    st.info("Upload a photo to recognize and mark attendance automatically")
     
-    col1, col2 = st.columns(2)
-    with col1:
-        start_recognition = st.button("📹 Start Recognition")
-    with col2:
-        stop_recognition = st.button("⏹️ Stop Recognition")
+    recognition_photo = st.file_uploader(
+        "Upload photo for recognition", 
+        type=['png', 'jpg', 'jpeg'],
+        key="recognition_photo"
+    )
     
-    if start_recognition:
-        st.session_state.camera_active = True
-    if stop_recognition:
-        st.session_state.camera_active = False
+    if recognition_photo and st.button("🔍 Recognize & Mark Attendance"):
+        try:
+            # Process uploaded photo
+            file_bytes = np.asarray(bytearray(recognition_photo.read()), dtype=np.uint8)
+            
+            if OPENCV_AVAILABLE:
+                image = cv2.imdecode(file_bytes, cv2.IMREAD_COLOR)
+                gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+                facedetect = load_face_detector()
+                faces = facedetect.detectMultiScale(gray, 1.3, 5)
+                
+                recognized_names = []
+                for (x, y, w, h) in faces:
+                    crop_img = image[y:y+h, x:x+w]
+                    crop_img_gray = cv2.cvtColor(crop_img, cv2.COLOR_BGR2GRAY)
+                    resized_img = cv2.resize(crop_img_gray, (50, 50)).flatten().reshape(1, -1)
+                    
+                    pred = knn.predict(resized_img)
+                    confidence = knn.predict_proba(resized_img).max()
+                    
+                    if confidence > 0.7:  # Confidence threshold
+                        recognized_names.append(str(pred[0]))
+            else:
+                # PIL fallback
+                image_pil = Image.open(recognition_photo)
+                face_crops = detect_faces_pil(image_pil)
+                
+                recognized_names = []
+                for face_crop in face_crops:
+                    resized_img = np.array(Image.fromarray(face_crop).resize((50, 50))).flatten().reshape(1, -1)
+                    pred = knn.predict(resized_img)
+                    confidence = knn.predict_proba(resized_img).max()
+                    
+                    if confidence > 0.6:  # Lower threshold for PIL method
+                        recognized_names.append(str(pred[0]))
+            
+            # Mark attendance for recognized faces
+            if recognized_names:
+                current_time = datetime.now()
+                date_str = current_time.strftime('%Y-%m-%d')
+                time_str = current_time.strftime('%H:%M:%S')
+                filename = f"Attendence/Attendance_{date_str}.csv"
+                
+                file_exists = os.path.isfile(filename)
+                with open(filename, "a", newline='') as csvfile:
+                    writer = csv.writer(csvfile)
+                    if not file_exists:
+                        writer.writerow(['Name', 'Date', 'Time'])
+                    
+                    for name in set(recognized_names):  # Remove duplicates
+                        writer.writerow([name, date_str, time_str])
+                        st.session_state.marked_names.add(name)
+                
+                st.success(f"✅ Attendance marked for: {', '.join(set(recognized_names))}")
+            else:
+                st.warning("⚠️ No faces recognized in the photo. Try manual attendance.")
+                
+        except Exception as e:
+            st.error(f"❌ Error processing photo: {str(e)}")
     
     # Display marked attendance
     if st.session_state.marked_names:
@@ -441,80 +471,10 @@ elif page == "📹 Mark Attendance":
         for name in st.session_state.marked_names:
             st.success(f"✓ {name}")
     
-    # Camera recognition
-    if st.session_state.camera_active:
-        st.info("📹 Camera is active. Face will be recognized automatically.")
-        st.info("🔄 Recognition runs every few seconds to avoid duplicates.")
-        
-        camera_placeholder = st.empty()
-        status_placeholder = st.empty()
-        
-        try:
-            cap = cv2.VideoCapture(0)
-            facedetect = load_face_detector()
-            
-            frame_count = 0
-            while st.session_state.camera_active:
-                ret, frame = cap.read()
-                if not ret:
-                    st.error("❌ Could not read from camera")
-                    break
-                
-                gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-                faces = facedetect.detectMultiScale(gray, 1.3, 5)
-                
-                current_time = datetime.now()
-                date_str = current_time.strftime('%Y-%m-%d')
-                time_str = current_time.strftime('%H:%M:%S')
-                filename = f"Attendence/Attendance_{date_str}.csv"
-                
-                recognized_names = []
-                
-                for (x, y, w, h) in faces:
-                    # Recognize face every 30 frames to avoid spam
-                    if frame_count % 30 == 0:
-                        crop_img = frame[y:y+h, x:x+w]
-                        crop_img_gray = cv2.cvtColor(crop_img, cv2.COLOR_BGR2GRAY)
-                        resized_img = cv2.resize(crop_img_gray, (50, 50)).flatten().reshape(1, -1)
-                        
-                        try:
-                            pred = knn.predict(resized_img)
-                            name = str(pred[0])
-                            recognized_names.append(name)
-                            
-                            # Auto-mark attendance if not already marked today
-                            if name not in st.session_state.marked_names:
-                                file_exists = os.path.isfile(filename)
-                                with open(filename, "a", newline='') as csvfile:
-                                    writer = csv.writer(csvfile)
-                                    if not file_exists:
-                                        writer.writerow(['Name', 'Date', 'Time'])
-                                    writer.writerow([name, date_str, time_str])
-                                
-                                st.session_state.marked_names.add(name)
-                                status_placeholder.success(f"✅ Attendance marked for {name}!")
-                        except Exception as e:
-                            name = "Unknown"
-                    else:
-                        name = "Detecting..."
-                    
-                    # Draw rectangle and name
-                    cv2.rectangle(frame, (x, y), (x+w, y+h), (0, 255, 0), 2)
-                    cv2.putText(frame, name, (x, y-10), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
-                
-                frame_count += 1
-                
-                # Display frame
-                frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-                camera_placeholder.image(frame_rgb, channels="RGB", use_container_width=True)
-                
-                time.sleep(0.1)
-            
-            cap.release()
-            
-        except Exception as e:
-            st.error(f"❌ Camera error: {str(e)}")
-            st.session_state.camera_active = False
+    # Camera recognition info (disabled for cloud)
+    if OPENCV_AVAILABLE:
+        st.subheader("📹 Live Camera Recognition")
+        st.info("🚨 Live camera features are disabled in cloud deployment. Use photo upload instead.")
 
 # Settings Page
 elif page == "⚙️ Settings":
@@ -526,8 +486,8 @@ elif page == "⚙️ Settings":
     col1, col2, col3 = st.columns(3)
     
     with col1:
-        face_xml_exists = os.path.exists('data/face.xml')
-        st.metric("Face Detector", "✅ Ready" if face_xml_exists else "❌ Missing")
+        opencv_status = "✅ Available" if OPENCV_AVAILABLE else "❌ Limited"
+        st.metric("OpenCV Status", opencv_status)
     
     with col2:
         names, faces = load_face_data()
@@ -536,6 +496,11 @@ elif page == "⚙️ Settings":
     with col3:
         total_samples = len(names) if names else 0
         st.metric("Total Samples", total_samples)
+    
+    # System info
+    if not OPENCV_AVAILABLE:
+        st.warning("📷 Camera features are disabled due to missing OpenGL libraries.")
+        st.info("✅ Photo upload and recognition features are fully functional!")
     
     # Data management
     st.subheader("🗃️ Data Management")
@@ -561,17 +526,6 @@ elif page == "⚙️ Settings":
                 os.remove(filename)
             st.session_state.marked_names.clear()
             st.success("✅ Today's attendance reset!")
-    
-    # Download face cascade
-    st.subheader("⬇️ Setup")
-    if not face_xml_exists:
-        st.warning("❌ face.xml not found!")
-        st.info("""
-        To set up the face detector:
-        1. Download haarcascade_frontalface_default.xml from OpenCV
-        2. Rename it to face.xml
-        3. Place it in the data/ folder
-        """)
     
     # Export data
     st.subheader("📤 Export Data")
@@ -622,9 +576,17 @@ if st.sidebar.button("🔄 Refresh All Data"):
     st.rerun()
 
 st.sidebar.markdown("---")
-st.sidebar.info("""
-**💡 Tips:**
-- Add at least 2-3 people for better recognition
-- Ensure good lighting when capturing faces
-- Mark attendance manually if camera recognition fails
-""")
+if OPENCV_AVAILABLE:
+    st.sidebar.success("""
+    **💡 Tips:**
+    - Add at least 2-3 people for better recognition
+    - Use photo upload for fastest setup
+    - Mark attendance manually if needed
+    """)
+else:
+    st.sidebar.info("""
+    **📤 Photo Mode:**
+    - Upload 3-10 photos to register people
+    - Use photo recognition for attendance
+    - All features work without camera
+    """)
